@@ -1,4 +1,3 @@
-import math
 import torch
 import pytest
 
@@ -6,6 +5,7 @@ from dsa_attention import (
     dsa_attention_torch,
     dsa_attention_naive,
     dsa_attention_triton,
+    dsa_attention_split_triton,
 )
 
 
@@ -50,3 +50,12 @@ def test_all_three_agree_small():
     d_bc = (b - c).abs().max().item()
     assert d_ab < 1e-4, f"naive/torch diff {d_ab}"
     assert d_bc < 5e-4, f"torch/triton diff {d_bc}"
+
+
+@pytest.mark.parametrize("T,top_k", [(32, 8), (64, 16), (128, 32)])
+def test_split_triton_matches_torch(T, top_k):
+    q_idx, k_idx, w_idx, Q, K, V = _make(T=T)
+    ref = dsa_attention_torch(q_idx, k_idx, w_idx, Q, K, V, top_k=top_k)
+    out = dsa_attention_split_triton(q_idx, k_idx, w_idx, Q, K, V, top_k=top_k)
+    diff = (out - ref).abs().max().item()
+    assert diff < 5e-4, f"split triton vs torch max diff {diff}"

@@ -25,7 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
-from lightning_indexer import indexer_scores_torch
+from lightning_indexer import indexer_scores_torch, indexer_scores_triton
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +34,6 @@ from lightning_indexer import indexer_scores_torch
 
 def dsa_attention_torch(q_idx, k_idx, w_idx, Q, K, V, top_k: int) -> torch.Tensor:
     B, T, HQ, DQ = Q.shape
-    DV = V.shape[-1]
     scale = 1.0 / math.sqrt(DQ)
 
     scores = indexer_scores_torch(q_idx, k_idx, w_idx)  # [B,T,T] (-inf off-causal)
@@ -60,7 +59,6 @@ def dsa_attention_torch(q_idx, k_idx, w_idx, Q, K, V, top_k: int) -> torch.Tenso
 def dsa_attention_naive(q_idx, k_idx, w_idx, Q, K, V, top_k: int) -> torch.Tensor:
     B, T, HQ, DQ = Q.shape
     DV = V.shape[-1]
-    HI = q_idx.shape[2]
     scale = 1.0 / math.sqrt(DQ)
     out = torch.zeros(B, T, HQ, DV, device=Q.device, dtype=torch.float32)
 
@@ -209,21 +207,139 @@ def dsa_attention_triton(q_idx, k_idx, w_idx, Q, K, V, top_k: int,
 
     q_idx, k_idx, w_idx = q_idx.contiguous(), k_idx.contiguous(), w_idx.contiguous()
     Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
-    O = torch.empty(B, T, HQ, DV, device=Q.device, dtype=torch.float32)
+    out = torch.empty(B, T, HQ, DV, device=Q.device, dtype=torch.float32)
     scale = 1.0 / math.sqrt(DQ)
 
     grid = (B, T)
     _dsa_fused_kernel[grid](
-        q_idx, k_idx, w_idx, Q, K, V, O,
+        q_idx, k_idx, w_idx, Q, K, V, out,
         q_idx.stride(0), q_idx.stride(1), q_idx.stride(2), q_idx.stride(3),
         k_idx.stride(0), k_idx.stride(1), k_idx.stride(2),
         w_idx.stride(0), w_idx.stride(1), w_idx.stride(2),
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
         K.stride(0), K.stride(1), K.stride(2), K.stride(3),
         V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-        O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         scale,
         T_const=T, HI=HI, DI=DI, HQ=HQ, DQ=DQ, DV=DV,
         TOP_K=top_k, BLOCK_S=BLOCK_S,
     )
-    return O
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 4. Split Triton path (indexer kernel + GPU top-k + sparse attention kernel)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _sparse_attn_kernel(
+    SCORES_ptr, THR_ptr,
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    sScb, sSct, sScs,
+    sTb, sTt,
+    sQb, sQt, sQh, sQd,
+    sKb, sKt, sKh, sKd,
+    sVb, sVt, sVh, sVd,
+    sOb, sOt, sOh, sOd,
+    SCALE,
+    T_const: tl.constexpr,
+    HQ: tl.constexpr, DQ: tl.constexpr, DV: tl.constexpr,
+):
+    b = tl.program_id(0)
+    t = tl.program_id(1)
+
+    offs_dq = tl.arange(0, DQ)
+    offs_dv = tl.arange(0, DV)
+    offs_hq = tl.arange(0, HQ)
+    offs_T = tl.arange(0, T_const)
+
+    scores = tl.load(SCORES_ptr + b * sScb + t * sSct + offs_T * sScs).to(tl.float32)
+    thr = tl.load(THR_ptr + b * sTb + t * sTt).to(tl.float32)
+    keep_full = (scores >= thr) & (offs_T <= t)
+
+    q = tl.load(
+        Q_ptr + b * sQb + t * sQt
+        + offs_hq[:, None] * sQh + offs_dq[None, :] * sQd,
+    ).to(tl.float32)
+
+    K_full = tl.load(
+        K_ptr + b * sKb
+        + offs_T[:, None, None] * sKt
+        + offs_hq[None, :, None] * sKh
+        + offs_dq[None, None, :] * sKd,
+    ).to(tl.float32)
+    V_full = tl.load(
+        V_ptr + b * sVb
+        + offs_T[:, None, None] * sVt
+        + offs_hq[None, :, None] * sVh
+        + offs_dv[None, None, :] * sVd,
+    ).to(tl.float32)
+
+    logits_sh = tl.sum(q[None, :, :] * K_full, axis=2) * SCALE
+    logits = tl.trans(logits_sh)
+    NEG = -50.0
+    logits = tl.where(keep_full[None, :], logits, NEG)
+
+    m = tl.max(logits, axis=1)
+    p = tl.exp(logits - m[:, None])
+    p = tl.where(keep_full[None, :], p, 0.0)
+    denom = tl.sum(p, axis=1)
+
+    p_T = tl.trans(p)
+    weighted_V = p_T[:, :, None] * V_full
+    out = tl.sum(weighted_V, axis=0) / denom[:, None]
+    tl.store(
+        O_ptr + b * sOb + t * sOt
+        + offs_hq[:, None] * sOh + offs_dv[None, :] * sOd,
+        out,
+    )
+
+
+def sparse_attention_with_threshold_triton(scores, threshold, Q, K, V) -> torch.Tensor:
+    B, T, _ = scores.shape
+    HQ, DQ = Q.shape[-2], Q.shape[-1]
+    DV = V.shape[-1]
+
+    for n, v in [("T", T), ("HQ", HQ), ("DQ", DQ), ("DV", DV)]:
+        assert v & (v - 1) == 0 and v > 0, f"{n}={v} must be a power of 2"
+
+    scores = scores.contiguous()
+    threshold = threshold.contiguous()
+    Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
+    out = torch.empty(B, T, HQ, DV, device=Q.device, dtype=torch.float32)
+    scale = 1.0 / math.sqrt(DQ)
+
+    grid = (B, T)
+    _sparse_attn_kernel[grid](
+        scores, threshold, Q, K, V, out,
+        scores.stride(0), scores.stride(1), scores.stride(2),
+        threshold.stride(0), threshold.stride(1),
+        Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+        K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+        V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        scale,
+        T_const=T, HQ=HQ, DQ=DQ, DV=DV,
+    )
+    return out
+
+
+def dsa_attention_split_triton(q_idx, k_idx, w_idx, Q, K, V, top_k: int,
+                               BLOCK_T: int = 32,
+                               BLOCK_S: int = 32) -> torch.Tensor:
+    B, T, HQ, DQ = Q.shape
+    DV = V.shape[-1]
+    HI, DI = q_idx.shape[2], q_idx.shape[3]
+
+    for n, v in [("T", T), ("HI", HI), ("DI", DI), ("HQ", HQ), ("DQ", DQ),
+                 ("DV", DV), ("BLOCK_T", BLOCK_T), ("BLOCK_S", BLOCK_S),
+                 ("top_k", top_k)]:
+        assert v & (v - 1) == 0 and v > 0, f"{n}={v} must be a power of 2"
+    assert T % BLOCK_T == 0, "T must be divisible by BLOCK_T"
+    assert T % BLOCK_S == 0, "T must be divisible by BLOCK_S"
+    assert top_k <= T
+
+    scores = indexer_scores_triton(q_idx, k_idx, w_idx, BLOCK_T=BLOCK_T, BLOCK_S=BLOCK_S)
+    topv, _ = scores.topk(top_k, dim=-1)
+    threshold = topv[..., -1:]
+    return sparse_attention_with_threshold_triton(scores, threshold, Q, K, V)

@@ -145,16 +145,17 @@ def plot_hybrid_endtoend():
         t_g = time_gpu(lambda: dsa_attention_triton(qi, ki, wi, Q, K, V, top_k=k, BLOCK_S=32))
         t_h = time_gpu(lambda: dsa_hybrid_cpu_topk(qi, ki, wi, Q, K, V, top_k=k, ctx=ctx))
         labels.append(f"B={B}\nT={T}\nk={k}")
-        gpu_t.append(t_g); hyb_t.append(t_h)
+        gpu_t.append(t_g)
+        hyb_t.append(t_h)
         print(f"({B},{T},{k}): gpu={t_g:.3f} hyb={t_h:.3f} -> {t_g/t_h:.2f}x")
 
     x_pos = np.arange(len(labels))
     w = 0.4
     fig, ax = plt.subplots(figsize=(12, 5.5), facecolor=BG)
-    b1 = ax.bar(x_pos - w / 2, gpu_t, w, color=GPU_COLOR, label="All-GPU fused (Triton)",
-                edgecolor=FG, linewidth=0.5)
-    b2 = ax.bar(x_pos + w / 2, hyb_t, w, color=CPU_COLOR, label="CPU AVX-512 top-K hybrid",
-                edgecolor=FG, linewidth=0.5)
+    ax.bar(x_pos - w / 2, gpu_t, w, color=GPU_COLOR, label="All-GPU fused (Triton)",
+           edgecolor=FG, linewidth=0.5)
+    ax.bar(x_pos + w / 2, hyb_t, w, color=CPU_COLOR, label="CPU AVX-512 top-K hybrid",
+           edgecolor=FG, linewidth=0.5)
     for i in range(len(labels)):
         s = gpu_t[i] / hyb_t[i]
         ymax = max(gpu_t[i], hyb_t[i])
@@ -166,7 +167,7 @@ def plot_hybrid_endtoend():
     ax.set_ylabel("End-to-end DSA forward (ms)")
     ax.set_title("DSA forward pass: all-GPU fused vs CPU-offload hybrid",
                  fontsize=13, pad=15)
-    leg = ax.legend(facecolor=BG, edgecolor=GRID, labelcolor=FG, framealpha=0.9)
+    ax.legend(facecolor=BG, edgecolor=GRID, labelcolor=FG, framealpha=0.9)
     style_axes(ax)
     fig.tight_layout()
     out = os.path.join(OUT_DIR, "hybrid_endtoend.png")
@@ -199,9 +200,12 @@ def plot_crossover_heatmap():
     vmin = min(0.5, np.nanmin(grid))
     im = ax.imshow(grid, cmap=cmap, vmin=vmin, vmax=vmax,
                    aspect="auto", origin="lower")
-    ax.set_xticks(np.arange(len(Ts))); ax.set_xticklabels(Ts)
-    ax.set_yticks(np.arange(len(ks))); ax.set_yticklabels(ks)
-    ax.set_xlabel("Sequence length T"); ax.set_ylabel("top-k")
+    ax.set_xticks(np.arange(len(Ts)))
+    ax.set_xticklabels(Ts)
+    ax.set_yticks(np.arange(len(ks)))
+    ax.set_yticklabels(ks)
+    ax.set_xlabel("Sequence length T")
+    ax.set_ylabel("top-k")
     ax.set_title(f"Hybrid speedup over all-GPU fused (B={B})\n"
                  f"Green = hybrid wins, red = GPU wins", fontsize=12, pad=12)
     style_axes(ax)

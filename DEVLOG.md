@@ -73,16 +73,53 @@ rebuild).
    `standalone_topk.png`, `hybrid_endtoend.png`, `crossover_heatmap.png`.
    Embedded in the blog post.
 
+8. **Split Triton path** (`dsa_attention_split_triton`). Reuses the standalone
+   `indexer_scores_triton`, computes the k-th threshold with GPU `torch.topk`,
+   then calls a threshold-only sparse-attention Triton kernel. `dsa_hybrid.py`
+   now imports `sparse_attention_with_threshold_triton` instead of carrying a
+   duplicate kernel body.
+
+9. **Scaling sweep** (`bench_scaling.py`). Wall-clock end-to-end sweep over
+   B in `{1,2,4,8,16,32,64}`, T in `{64,128,256,512}`, and valid k in
+   `{8,16,32,64,128}`. Writes `scaling_sweep.csv` and
+   `scaling_law_speedup.png` to the blog image directory. The clean idle-CPU
+   rerun with `OMP_NUM_THREADS=16` found 27 hybrid wins out of 133 configs;
+   best was 1.38x at B=32,T=512,k=8. T=512 is the crossover band; small k
+   crosses first, and k=128 only wins at the largest batches.
+
+10. **CPU top-K structure pass** (`topk_avx512.cpp`). Removed per-row heap
+    allocation from the fallback path by reusing one buffer per OpenMP worker.
+    Added fixed-k stack-buffer specializations for k=8/16/32 and seeded every
+    top-k buffer from the first k row values. Larger k now uses a min-heap,
+    so accepted candidates cost O(log k) instead of shifting an O(k)
+    descending buffer. On the idle CPU, `OMP_NUM_THREADS=16` was the best
+    measured setting for the full sweep. Representative clean end-to-end
+    points: B=16,T=512,k=32 is 5.74 ms GPU vs 4.60 ms hybrid (1.25x);
+    B=64,T=512,k=64 is 26.26 ms GPU vs 22.78 ms hybrid (1.15x);
+    B=64,T=512,k=128 is 26.44 ms GPU vs 24.95 ms hybrid (1.06x).
+
+11. **Rejected optimization probes**. Batch-merge candidate buffering for
+    k=64/128 was added as `topk_threshold_batch_merge` and tested against the
+    heap path; it was exact but slower on normal, quantized/tied, and
+    almost-sorted rows. OpenMP binding/taskset pinning was also worse than
+    plain `OMP_NUM_THREADS=16` on this machine because it pinned onto busy
+    cores. A Triton repeated max-select threshold path for TOP_K<=32 passed
+    tests but did not beat `tl.sort` in the fused kernel, so the fused kernel
+    remains on `tl.sort`. Direct GPU writes to host-pinned top-k state were not
+    implemented; Triton/PyTorch does not make that a small local change, and it
+    would require a streaming tiled indexer plus CPU incremental top-k API.
+
 ## File map
 
 | File | Purpose |
 |---|---|
 | `lightning_indexer.py` | Indexer scores: torch ref + Triton kernel |
-| `dsa_attention.py` | Full DSA forward: naive / torch / fused-Triton |
+| `dsa_attention.py` | Full DSA forward: naive / torch / fused-Triton / split-Triton |
 | `topk_avx512.cpp` | AVX-512 k-th-largest C++ extension |
 | `dsa_hybrid.py` | Hybrid pipeline + threshold-only sparse-attn kernel |
 | `bench_avx512.py` | Standalone CPU top-K bench |
 | `bench_hybrid.py` | End-to-end DSA bench (the headline) |
+| `bench_scaling.py` | Larger wall-clock DSA scaling sweep + chart |
 | `make_plots.py` | Reproduces blog figures |
 | `test_indexer.py`, `test_dsa.py` | Numerical equivalence tests |
 | `pyproject.toml`, `uv.lock` | uv project |
@@ -93,9 +130,10 @@ rebuild).
 ```bash
 cd /home/infatoshi/cuda/DSA
 uv sync
-uv run pytest -q                    # 10 tests pass
+uv run pytest -q                    # tests pass
 uv run python bench_avx512.py       # standalone CPU top-K table
 uv run python bench_hybrid.py       # headline end-to-end table
+uv run python bench_scaling.py      # larger scaling sweep + chart
 uv run python make_plots.py         # regenerate blog figures
 ```
 
@@ -157,10 +195,10 @@ The C++ extension JIT-compiles on first run; cached in
      primitives. Could close the break-even at k=128 and push the
      hybrid win to higher k regimes.
 
-3. **Split the Triton kernel into indexer + attention.** Right now
-   they're glued; splitting lets you reuse the indexer for the hybrid
-   path without recompilation, and makes the register-pressure
-   ceiling per-kernel rather than for both at once.
+3. **Benchmark and optimize the split Triton path.** The implementation now
+   exists as `dsa_attention_split_triton`, but it still uses GPU `torch.topk`
+   for threshold extraction. Measure it against fused and hybrid paths, then
+   decide whether the threshold step needs a custom GPU select kernel.
 
 4. **Try FP8 indexer per the paper.** Indexer has tiny heads (HI=4,
    DI=32) so tensor cores are underutilized in fp32. The paper does

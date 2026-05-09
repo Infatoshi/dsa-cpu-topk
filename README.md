@@ -1,8 +1,8 @@
 # DSA + AVX-512 CPU top-K offload
 
 A from-scratch implementation of [DeepSeek Sparse Attention](https://arxiv.org/abs/2512.02556)
-(Lightning Indexer + top-K + sparse attention) with three forward variants
-(naive PyTorch loop, vectorized PyTorch, fused Triton) and a single-machine
+(Lightning Indexer + top-K + sparse attention) with four forward variants
+(naive PyTorch loop, vectorized PyTorch, fused Triton, split Triton) and a single-machine
 experiment: can we beat the all-GPU fused kernel by mid-pipeline offloading
 the top-K stage to a hand-written AVX-512 kernel on the CPU?
 
@@ -17,20 +17,22 @@ Full write-up: <https://elliotarledge.com/blog/dsa-cpu-topk>
 | File | Purpose |
 |---|---|
 | `lightning_indexer.py` | Torch reference + Triton kernel for the indexer score matrix `I[t,s] = Σⱼ wⱼ · ReLU(⟨qⱼ, kₛ⟩)` |
-| `dsa_attention.py` | Three end-to-end DSA forwards: `naive` (per-query Python loop), `torch` (vectorized), `triton` (fused single-kernel: indexer → `tl.sort` top-K → sparse attention) |
-| `topk_avx512.cpp` | C++ extension: per-row k-th-largest using AVX-512 vector compare + `_mm512_mask_compressstoreu_ps` + scalar buffer insertion, OpenMP-parallel over rows |
+| `dsa_attention.py` | Four end-to-end DSA forwards: `naive` (per-query Python loop), `torch` (vectorized), `triton` (fused single-kernel: indexer → `tl.sort` top-K → sparse attention), `split_triton` (indexer kernel → GPU top-K threshold → sparse attention kernel) |
+| `topk_avx512.cpp` | C++ extension: per-row k-th-largest using AVX-512 vector compare + `_mm512_mask_compressstoreu_ps`, sorted buffers for small k, min-heaps for larger k, OpenMP-parallel over rows |
 | `dsa_hybrid.py` | Hybrid pipeline: GPU indexer → pinned d2h → AVX-512 CPU top-K → pinned h2d → GPU sparse-attention kernel that takes a precomputed threshold (no in-kernel sort) |
 | `bench_avx512.py` | Standalone top-K-only bench: AVX-512 vs `torch.topk` on CPU |
 | `bench_hybrid.py` | End-to-end bench: all-GPU fused vs CPU-offload hybrid (the headline experiment) |
-| `test_indexer.py`, `test_dsa.py` | Numerical equivalence tests across all three implementations |
+| `bench_scaling.py` | Larger wall-clock sweep over `B`, `T`, and `k`, plus a scaling-law speedup chart |
+| `test_indexer.py`, `test_dsa.py`, `test_topk_avx512.py` | Numerical equivalence tests across the implementations and CPU top-K extension |
 
 ## Quick start
 
 ```bash
 uv sync
-uv run pytest -q                  # 10 tests, all 3 implementations agree
+uv run pytest -q                  # all implementations agree
 uv run python bench_avx512.py     # CPU AVX-512 vs torch.topk
 uv run python bench_hybrid.py     # all-GPU fused vs CPU-offload hybrid
+uv run python bench_scaling.py    # larger scaling sweep + matplotlib chart
 ```
 
 The C++ extension JIT-compiles on first run via `torch.utils.cpp_extension.load`
